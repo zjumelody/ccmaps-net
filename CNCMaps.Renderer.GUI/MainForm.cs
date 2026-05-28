@@ -22,6 +22,7 @@ namespace CNCMaps.GUI {
 
 	public partial class MainForm : Form {
 		public const string RendererExe = "CNCMaps.Renderer.exe";
+		private readonly string _guiConfigPath;	// ZJ修改：增加
 		private readonly bool _skipUpdateCheck;
 		// automatically swap between RA2/TS mix dir from registry
 		private bool _currentEngineRa2 = true;
@@ -29,6 +30,7 @@ namespace CNCMaps.GUI {
 
 		public MainForm() {
 			const string GuiConfig = "gui_settings.xml";
+			/* 原代码
 			string cfgPath;
 			if (File.Exists(GuiConfig))
 				cfgPath = GuiConfig;
@@ -37,6 +39,14 @@ namespace CNCMaps.GUI {
 				cfgPath = Path.Combine(localAppDir, GuiConfig);
 			}
 			Settings.Default.SettingsKey = cfgPath;
+			*/
+			// ZJ修改：将 GUI 设置优先保存在可执行文件同目录
+			var exeDir = Path.GetDirectoryName(Assembly.GetEntryAssembly().Location) ?? Environment.CurrentDirectory;
+		_guiConfigPath = Path.Combine(exeDir, GuiConfig);
+		// attempt to set SettingsKey as well (may not affect storage location)
+		try { Settings.Default.SettingsKey = _guiConfigPath; } catch { }
+		// if a settings file exists next to exe, load it into Settings.Default
+		LoadGuiSettingsFromFile();
 			InitializeComponent();
 
 
@@ -51,7 +61,49 @@ namespace CNCMaps.GUI {
 				LogManager.Configuration.AddTarget("gui", target);
 				LogManager.Configuration.LoggingRules.Add(new LoggingRule("*", LogLevel.Debug, target));
 				LogManager.ReconfigExistingLoggers();
+				}
+		}
+
+		// ZJ修改：增加
+		private void LoadGuiSettingsFromFile() {
+			try {
+				if (string.IsNullOrEmpty(_guiConfigPath)) return;
+				if (!File.Exists(_guiConfigPath)) return;
+				var doc = System.Xml.Linq.XDocument.Load(_guiConfigPath);
+				var root = doc.Root;
+				if (root == null) return;
+				foreach (var elem in root.Elements()) {
+					try {
+						var prop = Settings.Default.GetType().GetProperty(elem.Name.LocalName);
+						if (prop == null) continue;
+						var val = Convert.ChangeType(elem.Value, prop.PropertyType, System.Globalization.CultureInfo.InvariantCulture);
+						prop.SetValue(Settings.Default, val, null);
+					}
+					catch { }
+				}
 			}
+			catch { }
+		}
+
+		// ZJ修改：增加
+		private void SaveGuiSettingsToFile() {
+			if (string.IsNullOrEmpty(_guiConfigPath)) return;
+			var root = new System.Xml.Linq.XElement("Settings");
+			var props = Settings.Default.GetType().GetProperties(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+			foreach (var p in props) {
+				try {
+					if (!p.CanRead) continue;
+					var v = p.GetValue(Settings.Default, null);
+					if (v == null) continue;
+					root.Add(new System.Xml.Linq.XElement(p.Name, v.ToString()));
+				}
+				catch { }
+			}
+			var doc = new System.Xml.Linq.XDocument(root);
+			// ensure directory exists
+			var dir = Path.GetDirectoryName(_guiConfigPath);
+			if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
+			doc.Save(_guiConfigPath);
 		}
 
 		public MainForm(bool skipUpdateCheck) : this() {
@@ -191,7 +243,16 @@ namespace CNCMaps.GUI {
 			if (WindowState != FormWindowState.Minimized)
 				Settings.Default.windowlocation = this.Location.X + ", " +  this.Location.Y;
 
+			/* 原代码
 			Settings.Default.Save();
+			*/
+			// ZJ修改：Try to save settings to executable directory first; fall back to default Save()
+			try {
+				SaveGuiSettingsToFile();
+			}
+			catch {
+				try { Settings.Default.Save(); } catch { }
+			}
 		}
 
 		#region registry searching
