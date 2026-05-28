@@ -398,9 +398,21 @@ namespace CNCMaps.Engine.Map {
 
 			c = _theater.GetCollection(CollectionType.Building);
 			var cAlt = _theater.GetCollection(CollectionType.Overlay);
+			/* 原代码
 			foreach (var obj in _structureObjects.Where(obj => !c.HasObject(obj) && !cAlt.HasObject(obj)).ToList()) {
 				obj.Tile.RemoveObject(obj);
 				_structureObjects.Remove(obj);
+			}
+			*/
+			// ZJ修改：先找出要删除的对象，之后再删除，避免在循环中修改集合
+			foreach (var obj in _structureObjects.ToList()) {
+				bool inBuilding = c.HasObject(obj);
+				bool inOverlay = cAlt.HasObject(obj);
+				if (!inBuilding && !inOverlay) {
+					// Logger.Warn("Removing structure object {0} at {1} because it's not present in Building or Overlay collections", obj, obj.Tile);
+					obj.Tile.RemoveObject(obj);
+					_structureObjects.Remove(obj);
+				}
 			}
 
 			// Overlay check
@@ -436,7 +448,18 @@ namespace CNCMaps.Engine.Map {
 				tile.Drawable = _theater.GetCollection(CollectionType.Tiles).GetDrawable(tile);
 				foreach (var obj in tile.AllObjects) {
 					obj.Collection = _theater.GetObjectCollection(obj);
+					/* 原代码
 					obj.Drawable = obj.Collection.GetDrawable(obj);
+					*/
+					// ZJ修改：先检查集合里有没有这个对象，再获取Drawable，避免在集合里没有这个对象时调用GetDrawable导致的错误
+					if (obj.Collection == null) {
+						// Logger.Warn("No collection found for object {0} on tile {1}", obj, obj.Tile);
+						obj.Drawable = null;
+					}
+					else {
+						obj.Drawable = obj.Collection.GetDrawable(obj);
+						//if (obj.Drawable == null) Logger.Warn("Drawable missing for object {0} (collection {1}) on tile {2}", obj, obj.Collection.Type, obj.Tile);
+					}
 				}
 			}
 		}
