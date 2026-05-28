@@ -17,6 +17,8 @@ using CNCMaps.Shared;
 using NLog;
 using NLog.Config;
 using NLog.Targets;
+using System.Runtime.Remoting.Metadata.W3cXsd2001;
+using static CNCMaps.FileFormats.PktFile;
 
 namespace CNCMaps.Engine {
 	public class RenderEngine {
@@ -171,8 +173,15 @@ namespace CNCMaps.Engine {
 												   _settings.StartPositionMarking == StartPositionMarking.Starred))
 						map.DrawStartPositions();
 
-					if (_settings.OutputFile == "")
+					if (_settings.OutputFile == "") {
+						/* 原代码
 						_settings.OutputFile = DetermineMapName(mapFile, _settings.Engine, vfs);
+						*/
+						// ZJ修改：mapname 名字前面加上 filename
+						string finalName = DetermineMapName(mapFile, _settings.Engine, vfs);
+						// 这里考虑到有些文件名字一样但是后缀不一样，所以还是保留后缀名，否则去除后缀名的写法：Path.GetFileNameWithoutExtension(mapFile.FileName);
+						_settings.OutputFile = mapFile.FileName + "【" + StripPlayersFromName(finalName) + "】";
+					}
 
 					if (_settings.OutputDir == "")
 						_settings.OutputDir = Path.GetDirectoryName(_settings.InputFile);
@@ -364,9 +373,16 @@ namespace CNCMaps.Engine {
 		public string DetermineMapName(MapFile map, EngineType engine, VirtualFileSystem vfs) {
 			string fileNameWithoutExtension = Path.GetFileNameWithoutExtension(map.FileName);
 
+			// ZJ修改（新增）
+			string officialName = "";
+
 			IniFile.IniSection basic = map.GetSection("Basic");
 			if (basic.ReadBool("Official") == false)
+				/* 原代码
 				return StripPlayersFromName(MakeValidFileName(basic.ReadString("Name", fileNameWithoutExtension)));
+				*/
+				// ZJ修改，同时考虑 officialName 和 mapName
+				officialName = StripPlayersFromName(MakeValidFileName(basic.ReadString("Name", fileNameWithoutExtension)));
 
 			string mapExt = Path.GetExtension(_settings.InputFile);
 			string missionName = "";
@@ -523,14 +539,121 @@ namespace CNCMaps.Engine {
 			}
 
 			mapName = StripPlayersFromName(MakeValidFileName(mapName)).Replace("  ", " ");
+			/* 原代码
 			return mapName;
+			*/
+			// ZJ修改
+			// 1、括号字符替换
+			string finalName = mapName.Replace("（", "(").Replace("）", ")");
+			// 2、如果官方名字不为空且最终名字不包含官方名字，则把官方名字加到最终名字前面
+			if (officialName.Length > 0 && !finalName.Contains(officialName)) {
+				finalName = officialName + " + " + finalName;
+			}
+			_logger.Info("nnnnnnnnn officialName: {0}, finalName: {1}", officialName, finalName);
+			// 3、获取最大人数并加到名字上
+			int finalMaxPlayer = GetMapMaxPlayers(map, pktMapEntry, finalName);
+			finalName = finalName + "(" + finalMaxPlayer + ")";
+			// 4、去掉"2-"
+			finalName = finalName.Replace("(2-", "(").Replace("[2-", "[");
+			// 5、处理圆括号和方括号：(N)(N)→(N)，[N][N]→[N]
+			finalName = Regex.Replace(Regex.Replace(finalName, @"\((\d)\)\(\1\)", "($1)"), @"\[(\d)\]\[\1\]", "[$1]");
+			// 6、括号前统一有空格，但括号之间去掉空格
+			if (!finalName.Contains(" (")) finalName = finalName.Replace("(", " (");
+			finalName = finalName.Replace(") (", ")(");
+			return finalName;
+		}
+
+		// ZJ修改（新增方法）：获取最大玩家数
+		private int GetMapMaxPlayers(MapFile map, PktFile.PktMapEntry pktMapEntry, string finalName) {
+
+			int finalMaxPlayer = 0;
+
+			// 1、从名字中提取最大玩家数（如果有），支持"(N)"、"(N-M)"、"[N]"、"[N-M]"等格式的玩家数标注，优先取横杠后面的数字（如果有的话），否则取唯一的数字
+			int nameMaxPlayers = 0;
+			// 原表达式：@"\s*(\(|\[)\s*\d+(\s*-\s*\d+)?\s*(\)|\])\s*$"，其实是差不多相等的
+			string suffixCountPattern = @"\s*[(\[]\s*(?<num1>\d+)(?:\s*-\s*(?<num2>\d+))?\s*[)\]]\s*$";
+			Match match = Regex.Match(finalName, suffixCountPattern);
+			if (match.Success) {
+				string numberText = "0";
+				if (match.Groups["num2"].Success)
+					numberText = match.Groups["num2"].Value; // 有横杠，取横杠后面的数字
+				else
+					numberText = match.Groups["num1"].Value; // 没有横杠，取唯一的数字
+				if (int.TryParse(numberText, out int number))
+					nameMaxPlayers = number;
+			}
+			// bool hasMapNamePlayerCount = nameMaxPlayers >= 1;
+			// 清除结尾已有的纯数字人数标注，带园括号或方括号，可选是否有"-"加数字。如"(4)"或"(2-4)"或"[4]"等）
+			//string baseName = Regex.Replace(finalName, suffixCountPattern, "");
+
+			_logger.Info("nnnnnnnnn nameMaxPlayers: {0}", nameMaxPlayers);
+
+			int usableStarts = 0;
+			// 2、先尝试以这种方式获取最大玩家数
+			// Refinement: recompute usableStarts more robustly right before finalizing the name.
+			// Some maps use waypoint numbers 0..7, others 1..8. Also dedupe by tile coordinates.
+			try {
+				if (map.Waypoints != null && map.Waypoints.Count > 0) {
+					var any = new System.Collections.Generic.HashSet<string>();
+					var zeroBased = new System.Collections.Generic.HashSet<string>();
+					var oneBased = new System.Collections.Generic.HashSet<string>();
+					foreach (var wp in map.Waypoints) {
+						if (wp == null || wp.Tile == null) continue;
+						string key = wp.Tile.Rx + "," + wp.Tile.Ry;
+						any.Add(key);
+						int num = wp.Number;
+						if (num >= 0 && num <= 7) zeroBased.Add(key);
+						if (num >= 1 && num <= 8) oneBased.Add(key);
+					}
+					int refined = Math.Max(zeroBased.Count, oneBased.Count);
+					if (refined == 0)
+						refined = Math.Min(8, any.Count);
+					usableStarts = refined;
+					_logger.Info("sssssssss any.Count: {0}, zeroBased.Count: {1}, oneBased.Count: {2}", any.Count, zeroBased.Count, oneBased.Count);
+					_logger.Info("uuuuuuuuu map.Waypoints.Count: {0}, usableStarts: {1}", map.Waypoints.Count, usableStarts);
+				}
+			}
+			catch {
+				_logger.Info("eeeeeeeee usableStarts获取出错: {0} {1}", map.Waypoints.Count, usableStarts);
+			}
+
+			if (nameMaxPlayers >= 1 && nameMaxPlayers == usableStarts) {
+				// 3、如果从 finalName 内中获取的最大玩家数和 usableStarts 一致，那基本百分百确定这就是最大玩家数
+				_logger.Info("fffffffff-1 基本百分百确定这就是最大玩家数: {0}", usableStarts);
+				finalMaxPlayer = usableStarts;
+			}
+			else if (usableStarts >= 1) {
+				// 4、如果 usableStarts 符合，则以它为准
+				_logger.Info("fffffffff-2 如果 usableStarts 符合，则以它为准: {0}", usableStarts);
+				finalMaxPlayer = usableStarts;
+			}
+			else if (nameMaxPlayers >= 1) {
+				// 5、接下来看 nameMaxPlayers
+				_logger.Info("fffffffff-3 接下来看 nameMaxPlayers: {0}", nameMaxPlayers);
+				finalMaxPlayer = nameMaxPlayers;
+			}
+			else if (pktMapEntry != null && pktMapEntry.MaxPlayer >= 1 && pktMapEntry.MaxPlayer <= 8) {
+				// 6、否则通过 pktMapEntry 来判断
+				_logger.Info("fffffffff-4 finalMaxPlayers: {0}, usableStarts: {1}, pktMapEntry.MaxPlayer: {2}", nameMaxPlayers, usableStarts, pktMapEntry.MaxPlayer);
+				finalMaxPlayer = pktMapEntry.MaxPlayer;
+			}
+			else {
+				// 7、以上都不满足则默认置为2
+				_logger.Info("fffffffff-5 finalMaxPlayers: {0}", finalMaxPlayer);
+				finalMaxPlayer = 2;
+			}
+
+			return finalMaxPlayer;
 		}
 
 		private static string StripPlayersFromName(string mapName) {
-			if (mapName.IndexOf(" (") != -1)
-				mapName = mapName.Substring(0, mapName.IndexOf(" ("));
-			else if (mapName.IndexOf(" [") != -1)
-				mapName = mapName.Substring(0, mapName.IndexOf(" ["));
+			// ZJ修改：注释掉了这两句，即不进行对" ("和" ["的处理
+			//if (mapName.IndexOf(" (") != -1)
+			//	mapName = mapName.Substring(0, mapName.IndexOf(" ("));
+			//else if (mapName.IndexOf(" [") != -1)
+			//	mapName = mapName.Substring(0, mapName.IndexOf(" ["));
+			// 新增处理双空格和全角括号
+			mapName = mapName.Replace("  ", " ").Replace("（", "(").Replace("）", ")");
 			return mapName;
 		}
 
